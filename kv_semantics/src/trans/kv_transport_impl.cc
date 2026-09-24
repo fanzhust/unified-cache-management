@@ -23,9 +23,13 @@
  * */
 #include "kv_transport_impl.h"
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <exception>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -38,6 +42,8 @@
 namespace kv {
 
 namespace {
+
+constexpr std::size_t kDefaultAsyncSendMaxInflight = 2;
 
 std::chrono::steady_clock::time_point TaskDeadline(std::uint64_t timeoutMs)
 {
@@ -81,6 +87,49 @@ Status AsuTransportImpl::Init(const TransportConfig& config,
     if (!transProvider_) {
         KV_ERROR("AsuTransportImpl::Init: TransProvider is null");
         return Status::Error(StatusCode::NOT_INITIALIZED, "TransProvider is null");
+    }
+
+    auto sendMode = std::string{"sync"};
+    if (const auto modeIt = config_.attrs.find("aicpu_send_mode");
+        modeIt != config_.attrs.end()) {
+        sendMode = modeIt->second;
+        std::transform(sendMode.begin(), sendMode.end(), sendMode.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    }
+    if (sendMode != "sync" && sendMode != "async") {
+        return Status::Error(StatusCode::INVALID_ARGUMENT,
+                             "aicpu_send_mode must be sync or async");
+    }
+    asyncSendEnabled_ = sendMode == "async";
+    asyncSendMaxInflight_ = kDefaultAsyncSendMaxInflight;
+    if (const auto inflightIt = config_.attrs.find("aicpu_send_max_inflight");
+        inflightIt != config_.attrs.end()) {
+        try {
+            std::size_t parsedCharacters = 0;
+            const auto parsed = std::stoull(inflightIt->second, &parsedCharacters);
+            if (inflightIt->second.empty() || inflightIt->second.front() == '-' ||
+                parsedCharacters != inflightIt->second.size() ||
+                parsed > std::numeric_limits<std::size_t>::max()) {
+                throw std::out_of_range("aicpu_send_max_inflight");
+            }
+            asyncSendMaxInflight_ = static_cast<std::size_t>(parsed);
+        } catch (const std::exception&) {
+            return Status::Error(StatusCode::INVALID_ARGUMENT,
+                                 "aicpu_send_max_inflight must be a positive integer");
+        }
+    }
+    if (asyncSendEnabled_ && asyncSendMaxInflight_ == 0) {
+        return Status::Error(StatusCode::INVALID_ARGUMENT,
+                             "aicpu_send_max_inflight must be greater than 0");
+    }
+    if (asyncSendEnabled_) {
+        asyncSendMaxInflight_ =
+            std::min(asyncSendMaxInflight_,
+                     std::max<std::size_t>(1, config_.maxInflightTasks));
+    }
+    if (asyncSendEnabled_ && !transProvider_->SupportsAsyncSend()) {
+        return Status::Error(StatusCode::UNSUPPORTED,
+                             "configured transport provider does not support AsyncSend");
     }
 
     std::string localIp;
@@ -161,7 +210,8 @@ Status AsuTransportImpl::Init(const TransportConfig& config,
     stopCompletionWorker_.store(false, std::memory_order_release);
     worker_ = std::thread(&AsuTransportImpl::WorkerLoop, this);
     completionWorker_ = std::thread(&AsuTransportImpl::CompletionLoop, this);
-    KV_DEBUG("AsuTransportImpl::Init OK: queueDepth={}", queueDepth);
+    KV_INFO("AsuTransportImpl::Init OK: queueDepth={} send_mode={} send_max_inflight={}",
+            queueDepth, asyncSendEnabled_ ? "async" : "sync", asyncSendMaxInflight_);
     return Status::OK();
 }
 
@@ -279,7 +329,46 @@ void AsuTransportImpl::WorkerLoop()
 {
     executeQueue_.ConsumerLoop(stopWorker_, producerMu_, workerCv_, [this](TransportTaskPtr task) {
         if (!task) { return; }
-        if (taskExecutor_->Execute(task)) { taskManager_.NotifyCompletion(task); }
+        if (!asyncSendEnabled_) {
+            if (taskExecutor_->Execute(task)) { taskManager_.NotifyCompletion(task); }
+            return;
+        }
+
+        struct PendingSend {
+            TransportTaskPtr task;
+            TransProvider::SendOperationPtr operation;
+        };
+        std::vector<PendingSend> pending;
+        pending.reserve(asyncSendMaxInflight_);
+
+        const auto launchStartedAt = std::chrono::steady_clock::now();
+        std::size_t taskCount = 0;
+        auto pendingTask = std::move(task);
+        while (pendingTask && taskCount < asyncSendMaxInflight_) {
+            ++taskCount;
+            TransProvider::SendOperationPtr operation;
+            const bool done = taskExecutor_->ExecuteAsync(pendingTask, operation);
+            if (done) { taskManager_.NotifyCompletion(pendingTask); }
+            if (operation) {
+                pending.push_back(PendingSend{pendingTask, std::move(operation)});
+            }
+
+            pendingTask.reset();
+            if (taskCount < asyncSendMaxInflight_) {
+                (void)executeQueue_.TryPop(pendingTask);
+            }
+        }
+        KV_DEBUG("AsyncSend fanout tasks={} launched={} elapsed_us={}", taskCount,
+                 pending.size(),
+                 std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now() - launchStartedAt)
+                     .count());
+
+        for (auto& pendingSend : pending) {
+            if (taskExecutor_->WaitAsync(pendingSend.task, pendingSend.operation)) {
+                taskManager_.NotifyCompletion(pendingSend.task);
+            }
+        }
     });
 }
 

@@ -123,6 +123,17 @@ TEST_F(TransportTaskCompletionTest, InitRejectsZeroMaxErrorCount)
     EXPECT_EQ(status.code, StatusCode::INVALID_ARGUMENT);
 }
 
+TEST_F(TransportTaskCompletionTest, InitRejectsAsyncModeForUnsupportedProvider)
+{
+    TransportConfig config;
+    config.attrs["aicpu_send_mode"] = "async";
+    config.attrs["aicpu_send_max_inflight"] = "2";
+
+    const auto status = transport_->Init(config, transport_->transProvider_);
+
+    EXPECT_EQ(status.code, StatusCode::UNSUPPORTED);
+}
+
 TEST_F(TransportTaskCompletionTest, TaskExecutorSupportsExplicitLifecycle)
 {
     AsuTransportImpl transport;

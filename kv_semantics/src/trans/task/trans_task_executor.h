@@ -65,6 +65,10 @@ public:
     Status Shutdown();
 
     bool Execute(const TransportTaskPtr& task);
+    bool ExecuteAsync(const TransportTaskPtr& task,
+                      TransProvider::SendOperationPtr& operation);
+    bool WaitAsync(const TransportTaskPtr& task,
+                   TransProvider::SendOperationPtr& operation);
     bool Poll(const TransportTaskPtr& task);
     bool Cancel(const TransportTaskPtr& task);
 
@@ -88,6 +92,10 @@ private:
                                   std::vector<TransProvider::SendIoBatch>& ioBatches);
     void SendSubBatchBuffers(std::vector<TransportSubBatchContext>& subBatchContexts,
                              const std::vector<TransProvider::SendIoBatch>& ioBatches);
+    void ApplySubBatchSendStatuses(
+        std::vector<TransportSubBatchContext>& subBatchContexts,
+        const std::vector<Status>& sendStatuses, std::size_t expectedCount);
+    void RecordSendComplete(const TransportTaskPtr& task);
 
     void AbortSubBatchesBeforeSend(TransportTask& task,
                                    std::vector<TransportSubBatchContext>& subBatchContexts);
