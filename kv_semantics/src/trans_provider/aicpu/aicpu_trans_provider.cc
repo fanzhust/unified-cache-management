@@ -65,7 +65,7 @@ constexpr std::uint32_t kChannelStatusPollIntervalMs = 2U;
 constexpr std::uintptr_t kHostRegisterAlignment = 4096U;
 constexpr const char* kDefaultChannelName = "ucm_asu_aicpu";
 constexpr const char* kProviderSignature =
-    "UCM_ASU_AICPU_PROVIDER_UBC_CTP_UBG_HCOMM_HIXL_ASYNC_V11";
+    "UCM_ASU_AICPU_PROVIDER_UBC_CTP_UBG_HCOMM_HIXL_DUALMODE_V12";
 constexpr const char* kBatchSendKernelName = "HixlBatchSend";
 #if UCM_ASU_AICPU_USE_STAGED_CHANNEL_API
 constexpr const char* kChannelApiMode = "HcommChannelCreateStaged";
@@ -577,6 +577,7 @@ struct AICPUTransProvider::Impl {
           sendTimeoutMs(ParseConfigUint32(
               GetConfigAttr(configIn, {"aicpu_send_timeout_ms", "send_timeout_ms", "timeout"}),
               kDefaultSendTimeoutMs)),
+          sendMode(ToLower(GetConfigAttr(configIn, {"aicpu_send_mode", "send_mode"}))),
           sendMaxInflight(ParseConfigUint32(
               GetConfigAttr(configIn, {"aicpu_send_max_inflight", "send_max_inflight"}),
               kDefaultSendMaxInflight)),
@@ -593,6 +594,12 @@ struct AICPUTransProvider::Impl {
         localDeviceId = selection.deviceId;
         providerContext = selection.context;
         deviceSelectionSource = std::move(selection.source);
+        if (sendMode.empty()) { sendMode = "sync"; }
+        if (sendMode != "sync" && sendMode != "async") {
+            KV_WARN("AICPUTransProvider: unsupported send_mode={}, falling back to sync",
+                    sendMode);
+            sendMode = "sync";
+        }
         if (channelName.empty()) { channelName = kDefaultChannelName; }
     }
 
@@ -1074,6 +1081,110 @@ struct AICPUTransProvider::Impl {
         return Status::OK();
     }
 
+    // Original synchronous implementation. Keep this path independent from the async ticket
+    // implementation so sync/async can be selected explicitly for regression and benchmarking.
+    Status LaunchBatchSendLocked(ConnectionRecord& connection,
+                                 const std::vector<TransProvider::SendIoBatch>& ioBatches,
+                                 std::vector<std::uint32_t>& hixlStatuses)
+    {
+        hixlStatuses.assign(ioBatches.size(), 1U);
+        if (connection.channel == 0U || connection.thread == 0U) {
+            return Status::Error(StatusCode::CONNECTION_ERROR,
+                                 "AICPUTransProvider::Send: Hcomm channel is not ready");
+        }
+        if (!connection.hasImmOverride) {
+            return Status::Error(
+                StatusCode::CONNECTION_ERROR,
+                "AICPUTransProvider::Send: negotiated SendWithImm value is unavailable");
+        }
+
+        auto status = EnsureAclStreamLocked(connection);
+        if (!status.ok()) { return status; }
+
+        std::vector<UcmHixlSendIoBatch> batches;
+        batches.reserve(ioBatches.size());
+        for (const auto& io : ioBatches) {
+            auto* conn = ToConnectionRecord(io.connectionHandle);
+            if (conn != &connection) {
+                return Status::Error(
+                    StatusCode::INVALID_ARGUMENT,
+                    "AICPUTransProvider::Send: mixed connections in one launch group");
+            }
+            batches.push_back(UcmHixlSendIoBatch{connection.channel, io.sendBuffer, io.len,
+                                                 connection.immOverride, 0U});
+            KV_DEBUG(
+                "AICPUTransProvider: batch send entry channel={} thread={} addr={} len={} "
+                "imm=0x{:x}",
+                connection.channel, connection.thread, io.sendBuffer, io.len,
+                connection.immOverride);
+        }
+
+        status = EnsureMappedBatchWorkspaceLocked(connection, batches.size());
+        if (!status.ok()) { return status; }
+
+        auto& workspace = connection.mappedBatchWorkspace;
+        std::memcpy(workspace.HostBatches(), batches.data(),
+                    batches.size() * sizeof(UcmHixlSendIoBatch));
+        std::fill_n(workspace.HostStatuses(), hixlStatuses.size(), 1U);
+        // Host and AICPU use paired virtual addresses for one mapped allocation. Stream
+        // synchronization below completes device writes before Host reads the statuses.
+        std::atomic_thread_fence(std::memory_order_release);
+
+        aclrtFuncHandle func = nullptr;
+        status = LoadHixlBatchSend(func);
+        if (!status.ok()) { return status; }
+
+        UcmHixlBatchSendParam param{};
+        param.thread = connection.thread;
+        param.io_batches = workspace.DeviceBatches();
+        param.batch_size = static_cast<std::uint64_t>(batches.size());
+        param.status_array = workspace.DeviceStatuses();
+        param.timeout_ms = sendTimeoutMs;
+        param.stats = nullptr;
+        // Staged Hcomm channels use USER_CTL sender CQs. The paired HixlBatchSend
+        // consumes one sender CQE and advances CQ/SQ CI before HcommThreadJoin.
+        param.complete_sender_cqe = 1U;
+
+        aclrtArgsHandle args = nullptr;
+        aclrtParamHandle paramHandle = nullptr;
+        auto ret = aclrtKernelArgsInit(func, &args);
+        if (ret != ACL_SUCCESS) { return AclError("aclrtKernelArgsInit HixlBatchSend", ret); }
+        ret = aclrtKernelArgsAppend(args, &param, sizeof(param), &paramHandle);
+        if (ret != ACL_SUCCESS) { return AclError("aclrtKernelArgsAppend HixlBatchSend", ret); }
+        ret = aclrtKernelArgsFinalize(args);
+        if (ret != ACL_SUCCESS) { return AclError("aclrtKernelArgsFinalize HixlBatchSend", ret); }
+
+        aclrtLaunchKernelAttr attr{};
+        attr.id = ACL_RT_LAUNCH_KERNEL_ATTR_TIMEOUT;
+        attr.value.timeout = MakeKernelTimeoutSeconds(sendTimeoutMs);
+        aclrtLaunchKernelCfg cfg{};
+        cfg.numAttrs = 1U;
+        cfg.attrs = &attr;
+        KV_WARN("[SendTrace] launch_begin pid={} device={} stream={} thread={} batches={}",
+                getpid(), localDeviceId, connection.stream, connection.thread, batches.size());
+        ret = aclrtLaunchKernelWithConfig(func, kKernelBlockDim, connection.stream, &cfg, args,
+                                          nullptr);
+        KV_WARN("[SendTrace] launch_end pid={} stream={} thread={} ret={}", getpid(),
+                connection.stream, connection.thread, static_cast<int>(ret));
+        if (ret != ACL_SUCCESS) {
+            return AclError("aclrtLaunchKernelWithConfig HixlBatchSend", ret);
+        }
+        KV_WARN("[SendTrace] sync_begin pid={} stream={} thread={} timeout_ms={}", getpid(),
+                connection.stream, connection.thread, MakeAclSyncTimeoutMs(sendTimeoutMs));
+        ret = aclrtSynchronizeStreamWithTimeout(connection.stream,
+                                                MakeAclSyncTimeoutMs(sendTimeoutMs));
+        KV_WARN("[SendTrace] sync_end pid={} stream={} thread={} ret={}", getpid(),
+                connection.stream, connection.thread, static_cast<int>(ret));
+        if (ret != ACL_SUCCESS) {
+            return AclError("aclrtSynchronizeStreamWithTimeout HixlBatchSend", ret);
+        }
+
+        std::atomic_thread_fence(std::memory_order_acquire);
+        auto* statuses = static_cast<volatile std::uint32_t*>(workspace.HostStatuses());
+        for (std::size_t i = 0; i < hixlStatuses.size(); ++i) { hixlStatuses[i] = statuses[i]; }
+        return Status::OK();
+    }
+
     Status AsyncLaunchBatchSendLocked(
         const std::shared_ptr<ConnectionRecord>& connectionOwner,
         const std::vector<TransProvider::SendIoBatch>& ioBatches,
@@ -1260,6 +1371,7 @@ struct AICPUTransProvider::Impl {
     std::uint32_t ubSqDepth{kDefaultUbSqDepth};
     std::uint32_t qos{0};
     std::uint32_t sendTimeoutMs{kDefaultSendTimeoutMs};
+    std::string sendMode{"sync"};
     // Zero means no window limit: launch all connection groups before waiting.
     std::uint32_t sendMaxInflight{kDefaultSendMaxInflight};
     std::string channelName;
@@ -1298,11 +1410,11 @@ AICPUTransProvider::AICPUTransProvider(const TransportConfig& config)
         "AICPU_TRANSPORT_PROVIDER_SIGNATURE={} pid={} asu_id={} logical_device_id={} "
         "device_source={} provider_context={} protocol=ubg channel_api={} "
         "send_with_imm=1 complete_sender_cqe=1 publish_mrs=1 mapped_batch_io=1 "
-        "send_mode=async_launch_wait send_max_inflight={} channel_name={}",
+        "send_mode={} send_max_inflight={} channel_name={}",
         kProviderSignature, static_cast<long>(::getpid()), impl_->config.nodeId,
         impl_->localDeviceId, impl_->deviceSelectionSource,
         static_cast<const void*>(impl_->providerContext), kChannelApiMode,
-        impl_->sendMaxInflight, impl_->channelName);
+        impl_->sendMode, impl_->sendMaxInflight, impl_->channelName);
 }
 
 AICPUTransProvider::~AICPUTransProvider()
@@ -1713,10 +1825,11 @@ std::vector<Status> AICPUTransProvider::Send(const std::vector<SendIoBatch>& ioB
     (void)quietCount;
     if (ioBatches.empty()) { return {}; }
 
-    // Keep connection and memory lifecycle operations out of the launch/wait interval. The
-    // public Send contract remains synchronous; only the per-connection device work is fanned
-    // out before it is joined below.
-    std::lock_guard<std::recursive_mutex> resourceLock(impl_->resourceMu);
+    // The original sync path intentionally keeps its previous locking behavior. The async path
+    // additionally excludes connection and memory lifecycle operations from its launch/wait
+    // interval.
+    std::unique_lock<std::recursive_mutex> resourceLock(impl_->resourceMu, std::defer_lock);
+    if (impl_->sendMode == "async") { resourceLock.lock(); }
 
     struct ConnectionBatchGroup {
         std::shared_ptr<ConnectionRecord> connection;
@@ -1773,6 +1886,41 @@ std::vector<Status> AICPUTransProvider::Send(const std::vector<SendIoBatch>& ioB
     ScopedAclDeviceContext deviceScope("Send", deviceId, providerContext);
     const auto& deviceStatus = deviceScope.status();
     if (!deviceStatus.ok()) { return std::vector<Status>(ioBatches.size(), deviceStatus); }
+
+    if (impl_->sendMode == "sync") {
+        for (const auto& group : groups) {
+            std::lock_guard<std::mutex> sendLock(group.connection->sendMu);
+            KV_DEBUG("AICPUTransProvider: launching HixlBatchSend channel={} thread={} entries={}",
+                     group.connection->channel, group.connection->thread, group.batches.size());
+            std::vector<std::uint32_t> hixlStatuses;
+            const auto launchStatus =
+                impl_->LaunchBatchSendLocked(*group.connection, group.batches, hixlStatuses);
+            if (!launchStatus.ok()) {
+                for (const auto originalIndex : group.originalIndexes) {
+                    results[originalIndex] = launchStatus;
+                }
+                continue;
+            }
+            if (hixlStatuses.size() != group.originalIndexes.size()) {
+                const auto status =
+                    Status::Error(StatusCode::INTERNAL_ERROR,
+                                  "HixlBatchSend returned an unexpected status count");
+                for (const auto originalIndex : group.originalIndexes) {
+                    results[originalIndex] = status;
+                }
+                continue;
+            }
+            for (std::size_t groupIndex = 0; groupIndex < hixlStatuses.size(); ++groupIndex) {
+                if (hixlStatuses[groupIndex] == 0U) { continue; }
+                const auto originalIndex = group.originalIndexes[groupIndex];
+                results[originalIndex] = Status::Error(
+                    StatusCode::INTERNAL_ERROR,
+                    "HixlBatchSend failed for batch index " + std::to_string(originalIndex) +
+                        " status=" + std::to_string(hixlStatuses[groupIndex]));
+            }
+        }
+        return results;
+    }
 
     const auto fanoutBegin = std::chrono::steady_clock::now();
     const auto commonDeadline =

@@ -3,7 +3,7 @@
 ## 1. 决策与范围
 
 放弃“Host 线程池并行调用完整 `LaunchBatchSendLocked`”的方案。新方案不创建额外的
-Host worker，而是将当前同步函数拆分成两个阶段：
+Host worker，并在完整保留原同步函数的同时新增两个阶段式接口：
 
 1. `AsyncLaunchBatchSendLocked`：准备参数并把 `HixlBatchSend` 异步下发到 connection
    对应的 ACL stream，不等待 Kernel 完成。
@@ -11,9 +11,10 @@ Host worker，而是将当前同步函数拆分成两个阶段：
    in-flight operation。
 
 第一阶段只改造 AICPU Provider 内部实现。`TransProvider::Send` 的公共签名和同步语义保持
-不变：它按可配置的 in-flight 窗口依次 launch connection group，窗口满时等待最早的
-operation，最后 drain 全部 ticket，并按输入顺序返回状态。窗口为 0 或不小于 group 数量时，
-退化为“先 launch 全部、再等待全部”。
+不变。`send_mode=sync` 时执行原 `LaunchBatchSendLocked` 路径；`send_mode=async` 时按可配置
+的 in-flight 窗口依次 launch connection group，窗口满时等待最早的 operation，最后 drain
+全部 ticket，并按输入顺序返回状态。窗口为 0 或不小于 group 数量时，退化为“先 launch
+全部、再等待全部”。
 
 本方案不把远端 KV 完成纳入 `WaitBatchSend`。远端完成仍由现有 flag buffer 和
 `CompletionLoop` 处理。
@@ -274,6 +275,7 @@ stop accepting launches
 
 ### 阶段 A：拆分接口
 
+- 保留原 `LaunchBatchSendLocked` 同步实现。
 - 新增 `AsyncLaunchBatchSendLocked` 和 `WaitBatchSend`。
 - 保持公共 `TransProvider::Send` 为同步接口。
 - device in-flight 窗口先使用 1 做功能回归。
@@ -313,15 +315,19 @@ Provider shutdown，不应与内部 launch/wait 拆分混为一次修改。
 ## 13. 第一版实现状态（2026-09-24）
 
 - 已移除方案 1 的 Host thread pool、worker 配置和对应测试代码。
+- 原 `LaunchBatchSendLocked` 同步实现及其原调用循环完整保留，不依赖 ticket 代码。
 - 已实现 move-only `BatchSendTicket`、`AsyncLaunchBatchSendLocked` 和 `WaitBatchSend`。
+- `transport.aicpu_send_mode=sync|async` 用于选择两条独立路径；配置缺失或非法时默认
+  `sync`。`sync` 执行原实现，`async` 执行新增的 launch/wait 实现。
 - `Send` 使用单个 Host 调用线程执行滑动窗口 fan-out/fan-in；任一 wait 失败后仍继续 drain
-  其他已成功 launch 的 ticket。
-- `transport.aicpu_send_max_inflight` 控制设备侧最大 in-flight 数：默认值为 2，值 1 用于同步
-  基线，值 0 表示不限制（先 launch 全部 group）。
+  其他已成功 launch 的 ticket；此行为仅用于 `async` 模式。
+- `transport.aicpu_send_max_inflight` 仅控制 `async` 模式的设备侧最大 in-flight 数：默认值为
+  2，值 1 表示异步接口按单路窗口执行，值 0 表示不限制（先 launch 全部 group）。真正的原
+  同步基线应设置 `aicpu_send_mode=sync`。
 - 所有 ticket 共用一次 `Send` 的绝对 deadline，避免异常情况下累计等待 N 倍 timeout。
 - `Send` 在整个 launch/wait 周期持有 `resourceMu`；ticket 持有 connection 的 shared ownership；
   每个 connection 通过 `IDLE/LAUNCHED/WAITING/FAULTED` 状态阻止 workspace 和 stream 被错误复用。
 - 增加 `[SendTrace] submit_complete`、`sync_begin/sync_end` 和 `fanin_complete` 日志，便于区分
   提交、等待尾部和总耗时。
-- Provider 启动签名更新为 `UCM_ASU_AICPU_PROVIDER_UBC_CTP_UBG_HCOMM_HIXL_ASYNC_V11`，
-  同时打印 `send_mode=async_launch_wait` 和实际配置的 `send_max_inflight`，用于确认新 SO 已生效。
+- Provider 启动签名更新为 `UCM_ASU_AICPU_PROVIDER_UBC_CTP_UBG_HCOMM_HIXL_DUALMODE_V12`，
+  同时打印实际的 `send_mode` 和 `send_max_inflight`，用于确认新 SO 和选择路径已生效。
