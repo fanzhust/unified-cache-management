@@ -54,12 +54,14 @@ remote completion仍由 flag buffer + CompletionLoop 处理
 
 同步路径继续复用 `ConnectionRecord::mappedBatchWorkspace`。
 
-异步路径不能复用该 workspace，因为同一 connection 上的下一个 `AsyncSend` 会覆盖前一个 kernel 尚在访问的 `io_batches` 和 `status_array`。因此每个 operation/ticket 独立持有：
+异步路径不能让多个 in-flight operation 同时复用同一个 workspace，因为同一 connection 上的下一个 `AsyncSend` 会覆盖前一个 kernel 尚在访问的 `io_batches` 和 `status_array`。因此每个未完成的 operation/ticket 独占：
 
 - mapped batch workspace；
 - `shared_ptr<ConnectionRecord>`；
 - batch 数量和原始下标映射；
 - 绝对 deadline。
+
+connection 维护异步 workspace 池。`AsyncSend` 优先取能够容纳当前 batch 的最小空闲 workspace；没有足够容量时扩容最大的空闲 workspace，池为空时才申请并注册新的 mapped 内存。`WaitSend` 在 stream 同步成功后将 workspace 归还池中，所以稳定状态下 workspace 数量约等于该 connection 实际达到的最大 in-flight 数，而不是每次 Send 都执行 `aclrtMallocHost/aclrtHostRegister/aclrtHostUnregister/aclrtFreeHost`。如果 stream 同步失败，设备是否仍在访问内存无法确定，该 workspace 只进入隔离区，不再复用，直到 connection 清理。
 
 connection 记录未完成异步 send 数量。`DeleteConnections` 在数量非零时返回 `RESOURCE_BUSY`，防止 stream/channel/thread 被提前销毁。MR register/bind/unregister 与异步 launch 共用资源门禁；遇到已 launch 的 ticket 时等待其 drain，而不是把启动阶段正常的并发注册误报成失败。若 operation 无法 drain，则返回连接错误并保留隔离资源。调用方仍必须在释放 send/flag buffer 或销毁 provider 之前消费所有 operation。
 

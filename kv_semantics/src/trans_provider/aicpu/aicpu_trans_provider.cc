@@ -65,7 +65,7 @@ constexpr std::uint32_t kChannelStatusPollIntervalMs = 2U;
 constexpr std::uintptr_t kHostRegisterAlignment = 4096U;
 constexpr const char* kDefaultChannelName = "ucm_asu_aicpu";
 constexpr const char* kProviderSignature =
-    "UCM_ASU_AICPU_PROVIDER_UBC_CTP_UBG_HCOMM_HIXL_ASYNC_SEND_V13";
+    "UCM_ASU_AICPU_PROVIDER_UBC_CTP_UBG_HCOMM_HIXL_ASYNC_SEND_V14";
 constexpr const char* kBatchSendKernelName = "HixlBatchSend";
 #if UCM_ASU_AICPU_USE_STAGED_CHANNEL_API
 constexpr const char* kChannelApiMode = "HcommChannelCreateStaged";
@@ -159,6 +159,26 @@ std::string StagedPublishTargetKey(const StagedPublishTarget& target)
 #endif
 
 struct MappedBatchWorkspace {
+    MappedBatchWorkspace() = default;
+    MappedBatchWorkspace(const MappedBatchWorkspace&) = delete;
+    MappedBatchWorkspace& operator=(const MappedBatchWorkspace&) = delete;
+
+    MappedBatchWorkspace(MappedBatchWorkspace&& other) noexcept
+        : owner(std::move(other.owner)),
+          deviceBase(std::exchange(other.deviceBase, nullptr)),
+          capacity(std::exchange(other.capacity, 0))
+    {
+    }
+
+    MappedBatchWorkspace& operator=(MappedBatchWorkspace&& other) noexcept
+    {
+        if (this == &other) { return *this; }
+        owner = std::move(other.owner);
+        deviceBase = std::exchange(other.deviceBase, nullptr);
+        capacity = std::exchange(other.capacity, 0);
+        return *this;
+    }
+
     std::shared_ptr<void> owner;
     void* deviceBase{nullptr};
     std::size_t capacity{0};
@@ -205,13 +225,18 @@ struct ConnectionRecord {
     bool hasServerCapabilities{false};
     std::string stagedOobHost;
     std::uint16_t stagedOobPort{0};
-    // A stream is connection-local. Async sends queue multiple kernels on that stream and keep
-    // their mapped workspaces in the returned operation until WaitSend drains them.
+    // A stream is connection-local. Each in-flight async send owns one workspace. Successfully
+    // drained workspaces return to this connection-local pool instead of being registered and
+    // unregistered for every Send.
     std::mutex sendMu;
     std::uint64_t sendSequence{0};
     std::size_t asyncInflightCount{0};
     bool asyncFaulted{false};
     MappedBatchWorkspace mappedBatchWorkspace;
+    std::vector<MappedBatchWorkspace> asyncWorkspacePool;
+    // A failed stream synchronization does not prove that the device stopped accessing the
+    // workspace. Keep such memory alive and never reuse it before connection cleanup.
+    std::vector<MappedBatchWorkspace> quarantinedAsyncWorkspaces;
     aclrtStream stream{nullptr};
 };
 
@@ -1045,10 +1070,74 @@ struct AICPUTransProvider::Impl {
     }
 
     Status EnsureMappedBatchWorkspaceLocked(ConnectionRecord& connection,
-                                            std::size_t requiredCapacity)
+                                             std::size_t requiredCapacity)
     {
         return EnsureMappedBatchWorkspace(connection.mappedBatchWorkspace, requiredCapacity,
-                                          connection.channel);
+                                           connection.channel);
+    }
+
+    void AcquireAsyncBatchWorkspaceLocked(ConnectionRecord& connection,
+                                          std::size_t requiredCapacity,
+                                          MappedBatchWorkspace& workspace)
+    {
+        if (connection.asyncWorkspacePool.empty()) { return; }
+
+        std::size_t largestIndex = 0;
+        std::size_t bestFitIndex = connection.asyncWorkspacePool.size();
+        for (std::size_t index = 0; index < connection.asyncWorkspacePool.size(); ++index) {
+            const auto capacity = connection.asyncWorkspacePool[index].capacity;
+            if (capacity > connection.asyncWorkspacePool[largestIndex].capacity) {
+                largestIndex = index;
+            }
+            if (capacity >= requiredCapacity &&
+                (bestFitIndex == connection.asyncWorkspacePool.size() ||
+                 capacity < connection.asyncWorkspacePool[bestFitIndex].capacity)) {
+                bestFitIndex = index;
+            }
+        }
+
+        // Prefer the smallest workspace that already fits. If none fits, grow the largest idle
+        // workspace so a changing batch size does not make the pool grow without bound.
+        const auto selectedIndex =
+            bestFitIndex == connection.asyncWorkspacePool.size() ? largestIndex : bestFitIndex;
+        workspace = std::move(connection.asyncWorkspacePool[selectedIndex]);
+        if (selectedIndex + 1U != connection.asyncWorkspacePool.size()) {
+            connection.asyncWorkspacePool[selectedIndex] =
+                std::move(connection.asyncWorkspacePool.back());
+        }
+        connection.asyncWorkspacePool.pop_back();
+        KV_DEBUG(
+            "AICPUTransProvider: acquired async batch workspace host_addr={} capacity={} "
+            "required_capacity={} idle_workspaces={} channel={}",
+            workspace.owner.get(), workspace.capacity, requiredCapacity,
+            connection.asyncWorkspacePool.size(), connection.channel);
+    }
+
+    void RecycleAsyncBatchWorkspaceLocked(ConnectionRecord& connection,
+                                          MappedBatchWorkspace& workspace)
+    {
+        if (!workspace.owner) { return; }
+        const auto* hostAddress = workspace.owner.get();
+        const auto capacity = workspace.capacity;
+        connection.asyncWorkspacePool.push_back(std::move(workspace));
+        KV_DEBUG(
+            "AICPUTransProvider: recycled async batch workspace host_addr={} capacity={} "
+            "idle_workspaces={} channel={}",
+            hostAddress, capacity, connection.asyncWorkspacePool.size(), connection.channel);
+    }
+
+    void QuarantineAsyncBatchWorkspaceLocked(ConnectionRecord& connection,
+                                             MappedBatchWorkspace& workspace)
+    {
+        if (!workspace.owner) { return; }
+        const auto* hostAddress = workspace.owner.get();
+        const auto capacity = workspace.capacity;
+        connection.quarantinedAsyncWorkspaces.push_back(std::move(workspace));
+        KV_WARN(
+            "AICPUTransProvider: quarantined async batch workspace host_addr={} capacity={} "
+            "quarantined_workspaces={} channel={}",
+            hostAddress, capacity, connection.quarantinedAsyncWorkspaces.size(),
+            connection.channel);
     }
 
     Status LoadHixlBatchSend(aclrtFuncHandle& func)
@@ -1232,8 +1321,12 @@ struct AICPUTransProvider::Impl {
                 connection.immOverride);
         }
 
+        AcquireAsyncBatchWorkspaceLocked(connection, batches.size(), ticket.workspace);
         status = EnsureMappedBatchWorkspace(ticket.workspace, batches.size(), connection.channel);
-        if (!status.ok()) { return status; }
+        if (!status.ok()) {
+            RecycleAsyncBatchWorkspaceLocked(connection, ticket.workspace);
+            return status;
+        }
 
         auto& workspace = ticket.workspace;
         std::memcpy(workspace.HostBatches(), batches.data(),
@@ -1245,7 +1338,10 @@ struct AICPUTransProvider::Impl {
 
         aclrtFuncHandle func = nullptr;
         status = LoadHixlBatchSend(func);
-        if (!status.ok()) { return status; }
+        if (!status.ok()) {
+            RecycleAsyncBatchWorkspaceLocked(connection, ticket.workspace);
+            return status;
+        }
 
         UcmHixlBatchSendParam param{};
         param.thread = connection.thread;
@@ -1261,11 +1357,20 @@ struct AICPUTransProvider::Impl {
         aclrtArgsHandle args = nullptr;
         aclrtParamHandle paramHandle = nullptr;
         auto ret = aclrtKernelArgsInit(func, &args);
-        if (ret != ACL_SUCCESS) { return AclError("aclrtKernelArgsInit HixlBatchSend", ret); }
+        if (ret != ACL_SUCCESS) {
+            RecycleAsyncBatchWorkspaceLocked(connection, ticket.workspace);
+            return AclError("aclrtKernelArgsInit HixlBatchSend", ret);
+        }
         ret = aclrtKernelArgsAppend(args, &param, sizeof(param), &paramHandle);
-        if (ret != ACL_SUCCESS) { return AclError("aclrtKernelArgsAppend HixlBatchSend", ret); }
+        if (ret != ACL_SUCCESS) {
+            RecycleAsyncBatchWorkspaceLocked(connection, ticket.workspace);
+            return AclError("aclrtKernelArgsAppend HixlBatchSend", ret);
+        }
         ret = aclrtKernelArgsFinalize(args);
-        if (ret != ACL_SUCCESS) { return AclError("aclrtKernelArgsFinalize HixlBatchSend", ret); }
+        if (ret != ACL_SUCCESS) {
+            RecycleAsyncBatchWorkspaceLocked(connection, ticket.workspace);
+            return AclError("aclrtKernelArgsFinalize HixlBatchSend", ret);
+        }
 
         aclrtLaunchKernelAttr attr{};
         attr.id = ACL_RT_LAUNCH_KERNEL_ATTR_TIMEOUT;
@@ -1280,6 +1385,7 @@ struct AICPUTransProvider::Impl {
         KV_WARN("[SendTrace] launch_end pid={} stream={} thread={} ret={}", getpid(),
                 connection.stream, connection.thread, static_cast<int>(ret));
         if (ret != ACL_SUCCESS) {
+            RecycleAsyncBatchWorkspaceLocked(connection, ticket.workspace);
             return AclError("aclrtLaunchKernelWithConfig HixlBatchSend", ret);
         }
 
@@ -1331,6 +1437,11 @@ struct AICPUTransProvider::Impl {
             } else {
                 --connection.asyncInflightCount;
             }
+            if (ret == ACL_SUCCESS) {
+                RecycleAsyncBatchWorkspaceLocked(connection, ticket.workspace);
+            } else {
+                QuarantineAsyncBatchWorkspaceLocked(connection, ticket.workspace);
+            }
             if (!status.ok()) { connection.asyncFaulted = true; }
         }
         ticket.Reset();
@@ -1339,11 +1450,13 @@ struct AICPUTransProvider::Impl {
 
     void ResetConnectionSendResources(ConnectionRecord& connection)
     {
-        connection.mappedBatchWorkspace.Reset();
         if (connection.stream != nullptr) {
             (void)aclrtDestroyStream(connection.stream);
             connection.stream = nullptr;
         }
+        connection.mappedBatchWorkspace.Reset();
+        connection.asyncWorkspacePool.clear();
+        connection.quarantinedAsyncWorkspaces.clear();
         connection.asyncInflightCount = 0;
         connection.asyncFaulted = false;
     }
@@ -1396,7 +1509,7 @@ AICPUTransProvider::AICPUTransProvider(const TransportConfig& config)
         "AICPU_TRANSPORT_PROVIDER_SIGNATURE={} pid={} asu_id={} logical_device_id={} "
         "device_source={} provider_context={} protocol=ubg channel_api={} "
         "send_with_imm=1 complete_sender_cqe=1 publish_mrs=1 mapped_batch_io=1 "
-        "async_send=1 channel_name={}",
+        "async_send=1 async_workspace_pool=1 channel_name={}",
         kProviderSignature, static_cast<long>(::getpid()), impl_->config.nodeId,
         impl_->localDeviceId, impl_->deviceSelectionSource,
         static_cast<const void*>(impl_->providerContext), kChannelApiMode,
