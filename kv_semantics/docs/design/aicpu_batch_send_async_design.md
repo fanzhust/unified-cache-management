@@ -61,7 +61,7 @@ remote completion仍由 flag buffer + CompletionLoop 处理
 - batch 数量和原始下标映射；
 - 绝对 deadline。
 
-connection 记录未完成异步 send 数量。`DeleteConnections` 在数量非零时返回 `RESOURCE_BUSY`，防止 stream/channel/thread 被提前销毁。调用方必须在释放 send/flag buffer、注销 MR 或销毁 provider 之前消费所有 operation。
+connection 记录未完成异步 send 数量。`DeleteConnections` 在数量非零时返回 `RESOURCE_BUSY`，防止 stream/channel/thread 被提前销毁。MR register/bind/unregister 与异步 launch 共用资源门禁；遇到已 launch 的 ticket 时等待其 drain，而不是把启动阶段正常的并发注册误报成失败。若 operation 无法 drain，则返回连接错误并保留隔离资源。调用方仍必须在释放 send/flag buffer 或销毁 provider 之前消费所有 operation。
 
 ## 5. Completion、取消和超时
 

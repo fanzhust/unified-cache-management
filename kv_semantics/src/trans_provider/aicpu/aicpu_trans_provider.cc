@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -1367,6 +1368,8 @@ struct AICPUTransProvider::Impl {
     // the public release helpers while retaining this lock, hence the recursive mutex.
     std::recursive_mutex resourceMu;
     std::size_t asyncTicketCount{0};
+    bool asyncTicketDrainFailed{false};
+    std::condition_variable_any asyncTicketCv;
     std::vector<std::unique_ptr<AicpuSendOperation>> quarantinedSendOperations;
     EndpointHandle endpoint{nullptr};
     std::string endpointIp;
@@ -2008,8 +2011,10 @@ std::vector<Status> AICPUTransProvider::WaitSend(SendOperationPtr& operation)
             ticket.connection->asyncFaulted = true;
         }
         std::lock_guard<std::recursive_mutex> resourceLock(impl_->resourceMu);
+        impl_->asyncTicketDrainFailed = true;
         impl_->quarantinedSendOperations.emplace_back(
             static_cast<AicpuSendOperation*>(operation.release()));
+        impl_->asyncTicketCv.notify_all();
         KV_ERROR(
             "AICPUTransProvider::WaitSend quarantined operation because ACL context binding "
             "failed; connection resources remain busy until provider cleanup");
@@ -2027,6 +2032,7 @@ std::vector<Status> AICPUTransProvider::WaitSend(SendOperationPtr& operation)
             } else {
                 --impl_->asyncTicketCount;
             }
+            if (impl_->asyncTicketCount == 0) { impl_->asyncTicketCv.notify_all(); }
         }
         if (!waitStatus.ok()) {
             for (const auto originalIndex : originalIndexes) {
@@ -2104,12 +2110,23 @@ Status AICPUTransProvider::RegisterMemoryImpl(const std::vector<RegisterMemoryDe
                                  ": token count does not match memory count");
     }
 
-    std::lock_guard<std::recursive_mutex> resourceLock(impl_->resourceMu);
+    std::unique_lock<std::recursive_mutex> resourceLock(impl_->resourceMu);
     if (impl_->asyncTicketCount != 0) {
-        return Status::Error(
-            StatusCode::RESOURCE_BUSY,
-            std::string("AICPUTransProvider::") + operation +
-                ": asynchronous sends are still in flight");
+        KV_INFO("AICPUTransProvider::{} waiting for {} asynchronous send ticket(s)", operation,
+                impl_->asyncTicketCount);
+    }
+    const auto drained = impl_->asyncTicketCv.wait_for(
+        resourceLock, std::chrono::milliseconds(MakeAclSyncTimeoutMs(impl_->sendTimeoutMs)),
+        [this] { return impl_->asyncTicketCount == 0 || impl_->asyncTicketDrainFailed; });
+    if (!drained) {
+        return Status::Error(StatusCode::TIMEOUT,
+                             std::string("AICPUTransProvider::") + operation +
+                                 ": timed out waiting for asynchronous sends to drain");
+    }
+    if (impl_->asyncTicketDrainFailed) {
+        return Status::Error(StatusCode::CONNECTION_ERROR,
+                             std::string("AICPUTransProvider::") + operation +
+                                 ": an asynchronous send could not be drained");
     }
     ScopedAclDeviceContext deviceScope(operation, impl_->localDeviceId, impl_->providerContext);
     const auto& bindStatus = deviceScope.status();
@@ -2319,13 +2336,27 @@ std::vector<Status> AICPUTransProvider::ReleaseMemory(const std::vector<MRHandle
     std::vector<Status> results(mrHandles.size(), Status::OK());
     if (mrHandles.empty()) { return results; }
 
-    std::lock_guard<std::recursive_mutex> resourceLock(impl_->resourceMu);
+    std::unique_lock<std::recursive_mutex> resourceLock(impl_->resourceMu);
     if (impl_->asyncTicketCount != 0) {
+        KV_INFO("AICPUTransProvider::{} waiting for {} asynchronous send ticket(s)", operation,
+                impl_->asyncTicketCount);
+    }
+    const auto drained = impl_->asyncTicketCv.wait_for(
+        resourceLock, std::chrono::milliseconds(MakeAclSyncTimeoutMs(impl_->sendTimeoutMs)),
+        [this] { return impl_->asyncTicketCount == 0 || impl_->asyncTicketDrainFailed; });
+    if (!drained) {
         return std::vector<Status>(
             mrHandles.size(),
-            Status::Error(StatusCode::RESOURCE_BUSY,
+            Status::Error(StatusCode::TIMEOUT,
                           std::string("AICPUTransProvider::") + operation +
-                              ": asynchronous sends are still in flight"));
+                              ": timed out waiting for asynchronous sends to drain"));
+    }
+    if (impl_->asyncTicketDrainFailed) {
+        return std::vector<Status>(
+            mrHandles.size(),
+            Status::Error(StatusCode::CONNECTION_ERROR,
+                          std::string("AICPUTransProvider::") + operation +
+                              ": an asynchronous send could not be drained"));
     }
     ScopedAclDeviceContext deviceScope(operation, impl_->localDeviceId, impl_->providerContext);
     const auto& deviceStatus = deviceScope.status();
